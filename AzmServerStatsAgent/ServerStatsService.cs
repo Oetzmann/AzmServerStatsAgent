@@ -63,7 +63,7 @@ namespace AzmServerStatsAgent
             if (!int.TryParse(intervalStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out _intervalSeconds) || _intervalSeconds < 10)
                 _intervalSeconds = 30;
 
-            _currentHour = DateTime.UtcNow.Date.AddHours(DateTime.UtcNow.Hour);
+            _currentHour = DateTime.Now.Date.AddHours(DateTime.Now.Hour);
             _currentHourFilePath = GetHourFilePath(_currentHour);
 
             _timer = new Timer(_intervalSeconds * 1000.0);
@@ -89,7 +89,7 @@ namespace AzmServerStatsAgent
         {
             try
             {
-                DateTime now = DateTime.UtcNow;
+                DateTime now = DateTime.Now;
                 DateTime thisHour = now.Date.AddHours(now.Hour);
 
                 if (thisHour > _currentHour)
@@ -138,6 +138,14 @@ namespace AzmServerStatsAgent
 
         private decimal? GetCpuPercent()
         {
+            decimal? wmi = GetCpuPercentWmi();
+            if (wmi.HasValue)
+                return wmi;
+            return GetCpuPercentPerfCounter();
+        }
+
+        private decimal? GetCpuPercentWmi()
+        {
             try
             {
                 using (var searcher = new ManagementObjectSearcher("root\\CIMV2", "SELECT LoadPercentage FROM Win32_Processor"))
@@ -151,6 +159,23 @@ namespace AzmServerStatsAgent
                             return (decimal)u;
                         }
                     }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private decimal? GetCpuPercentPerfCounter()
+        {
+            try
+            {
+                using (var pc = new PerformanceCounter("Processor", "% Processor Time", "_Total"))
+                {
+                    pc.NextValue();
+                    System.Threading.Thread.Sleep(500);
+                    float v = pc.NextValue();
+                    if (v >= 0 && v <= 100)
+                        return Math.Round((decimal)v, 2);
                 }
             }
             catch { }
@@ -242,7 +267,7 @@ WHEN NOT MATCHED THEN
 
             DateTime lastUpdated;
             if (!DateTime.TryParse(sample.T, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out lastUpdated))
-                lastUpdated = DateTime.UtcNow;
+                lastUpdated = DateTime.Now;
 
             try
             {
@@ -261,7 +286,10 @@ WHEN NOT MATCHED THEN
             }
             catch (Exception ex)
             {
-                LogEvent("SQL Current Update fehlgeschlagen: " + ex.Message);
+                string full = ex.Message;
+                if (ex.InnerException != null)
+                    full = full + " | " + ex.InnerException.Message;
+                LogEvent("SQL Current Update fehlgeschlagen: " + full);
             }
         }
 
@@ -385,6 +413,13 @@ VALUES (@ServerName, @HourStart, @CpuAvg, @MemoryUsedAvgMB, @MemoryTotalMB, @Dri
             try
             {
                 EventLog.WriteEntry("AzmServerStatsAgent", message, EventLogEntryType.Information);
+            }
+            catch { }
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "AzmServerStatsAgent.log");
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " " + message + Environment.NewLine;
+                File.AppendAllText(logPath, line, Encoding.UTF8);
             }
             catch { }
         }
