@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Management;
+using System.Net;
 using System.ServiceProcess;
 using System.Text;
 using System.Timers;
@@ -22,6 +23,9 @@ namespace AzmServerStatsAgent
         private string _connectionString;
         private string _samplesDirectory;
         private int _intervalSeconds;
+        private string _rosterStatusUri;
+        private string _rosterStatusSecret;
+        private bool _rosterEnabled;
         private DateTime _currentHour;
         private string _currentHourFilePath;
         private readonly List<SampleRecord> _currentHourSamples = new List<SampleRecord>();
@@ -64,6 +68,10 @@ namespace AzmServerStatsAgent
             if (!int.TryParse(intervalStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out _intervalSeconds) || _intervalSeconds < 10)
                 _intervalSeconds = 30;
 
+            _rosterStatusUri = ConfigurationManager.AppSettings["RosterStatusUri"];
+            _rosterStatusSecret = ConfigurationManager.AppSettings["RosterStatusSecret"];
+            _rosterEnabled = !string.IsNullOrWhiteSpace(_rosterStatusUri) && !string.IsNullOrWhiteSpace(_rosterStatusSecret);
+
             _currentHour = DateTime.Now.Date.AddHours(DateTime.Now.Hour);
             _currentHourFilePath = GetHourFilePath(_currentHour);
 
@@ -72,7 +80,7 @@ namespace AzmServerStatsAgent
             _timer.AutoReset = true;
             _timer.Start();
 
-            LogEvent("AZM Server Stats Agent gestartet. Server=" + _serverName + ", Intervall=" + _intervalSeconds + "s");
+            LogEvent("AZM Server Stats Agent gestartet. Server=" + _serverName + ", Intervall=" + _intervalSeconds + "s, RosterEnabled=" + _rosterEnabled);
         }
 
         protected override void OnStop()
@@ -104,8 +112,12 @@ namespace AzmServerStatsAgent
                 if (sample == null)
                     return;
 
+                List<RosterSessionSnapshot> rosterSessions = null;
+                if (_rosterEnabled)
+                    rosterSessions = CollectRosterSessions();
+
                 AppendSampleToFile(sample);
-                UpdateCurrentInSql(sample);
+                UpdateCurrentInSql(sample, rosterSessions);
             }
             catch (Exception ex)
             {
@@ -239,6 +251,64 @@ namespace AzmServerStatsAgent
             return list;
         }
 
+        private List<RosterSessionSnapshot> CollectRosterSessions()
+        {
+            try
+            {
+                string completeUri = BuildRosterUri(_rosterStatusUri, _rosterStatusSecret);
+                if (string.IsNullOrWhiteSpace(completeUri))
+                    return new List<RosterSessionSnapshot>();
+
+                var request = (HttpWebRequest)WebRequest.Create(completeUri);
+                request.Method = "GET";
+                request.Accept = "application/json";
+                request.ContentType = "application/json";
+                request.Headers["PlanoSource"] = "AzmServerStatsAgent";
+                request.Timeout = 10000;
+                request.ReadWriteTimeout = 10000;
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var stream = response.GetResponseStream())
+                using (var reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    string content = reader.ReadToEnd();
+                    if (string.IsNullOrWhiteSpace(content))
+                        return new List<RosterSessionSnapshot>();
+
+                    var root = JsonConvert.DeserializeObject<RosterStatusResponse>(content);
+                    if (root == null || root.ActiveSessions == null || root.ActiveSessions.Count == 0)
+                        return new List<RosterSessionSnapshot>();
+
+                    var list = new List<RosterSessionSnapshot>();
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var s in root.ActiveSessions)
+                    {
+                        string user = s != null && s.UserName != null ? s.UserName.Trim() : "";
+                        string emp = s != null && s.EmployeeNumber != null ? s.EmployeeNumber.Trim() : "";
+                        if (string.IsNullOrEmpty(user)) continue;
+                        string key = (user + "|" + emp).ToUpperInvariant();
+                        if (seen.Contains(key)) continue;
+                        seen.Add(key);
+                        list.Add(new RosterSessionSnapshot { UserName = user, EmployeeNumber = emp });
+                    }
+                    return list;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogEvent("Roster API Aufruf fehlgeschlagen: " + ex.Message);
+                return new List<RosterSessionSnapshot>();
+            }
+        }
+
+        private static string BuildRosterUri(string baseUri, string secret)
+        {
+            if (string.IsNullOrWhiteSpace(baseUri) || string.IsNullOrWhiteSpace(secret))
+                return "";
+            string encoded = Uri.EscapeDataString(secret);
+            return baseUri + encoded;
+        }
+
         private void AppendSampleToFile(SampleRecord sample)
         {
             string line = JsonConvert.SerializeObject(sample) + Environment.NewLine;
@@ -256,7 +326,7 @@ namespace AzmServerStatsAgent
         private readonly List<GraphSample> _recentSamples = new List<GraphSample>();
         private static readonly int RecentMinutes = 30;
 
-        private void UpdateCurrentInSql(SampleRecord sample)
+        private void UpdateCurrentInSql(SampleRecord sample, List<RosterSessionSnapshot> rosterSessions)
         {
             string driveStatsJson = sample.Drives != null && sample.Drives.Count > 0
                 ? JsonConvert.SerializeObject(sample.Drives)
@@ -266,11 +336,14 @@ namespace AzmServerStatsAgent
             if (!DateTime.TryParse(sample.T, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out lastUpdated))
                 lastUpdated = DateTime.Now;
 
+            int? sessionsCount = _rosterEnabled ? (int?)((rosterSessions != null) ? rosterSessions.Count : 0) : (int?)null;
+
             /* --- Graph-Sample bauen und Ringpuffer pflegen --- */
             var gs = new GraphSample { T = lastUpdated.ToString("yyyy-MM-dd\\THH:mm:ss", CultureInfo.InvariantCulture) };
             gs.Cpu = sample.Cpu.HasValue ? Math.Round(sample.Cpu.Value, 1) : (decimal?)null;
             if (sample.MemUsed.HasValue && sample.MemTotal.HasValue && sample.MemTotal.Value > 0)
                 gs.Ram = Math.Round((decimal)sample.MemUsed.Value * 100 / sample.MemTotal.Value, 1);
+            gs.Sessions = sessionsCount;
             if (sample.Drives != null && sample.Drives.Count > 0)
             {
                 gs.Drives = new List<GraphDrive>();
@@ -298,30 +371,41 @@ namespace AzmServerStatsAgent
 
             string recentSamplesJson = JsonConvert.SerializeObject(_recentSamples);
 
-            /* --- SQL MERGE mit RecentSamplesJson --- */
+            /* --- SQL MERGE mit RecentSamplesJson + SessionsCount --- */
             string sql = @"
 MERGE [dbo].[azm_tool_server_stats_current] AS t
 USING (SELECT @ServerName AS ServerName) AS s ON t.ServerName = s.ServerName
 WHEN MATCHED THEN
-    UPDATE SET LastUpdated=@LastUpdated, CpuPercent=@CpuPercent, MemoryUsedMB=@MemoryUsedMB, MemoryTotalMB=@MemoryTotalMB, DriveStatsJson=@DriveStatsJson, RecentSamplesJson=@RecentSamplesJson
+    UPDATE SET LastUpdated=@LastUpdated, CpuPercent=@CpuPercent, MemoryUsedMB=@MemoryUsedMB, MemoryTotalMB=@MemoryTotalMB, DriveStatsJson=@DriveStatsJson, RecentSamplesJson=@RecentSamplesJson, SessionsCount=@SessionsCount
 WHEN NOT MATCHED THEN
-    INSERT (ServerName, LastUpdated, CpuPercent, MemoryUsedMB, MemoryTotalMB, DriveStatsJson, RecentSamplesJson)
-    VALUES (@ServerName, @LastUpdated, @CpuPercent, @MemoryUsedMB, @MemoryTotalMB, @DriveStatsJson, @RecentSamplesJson);";
+    INSERT (ServerName, LastUpdated, CpuPercent, MemoryUsedMB, MemoryTotalMB, DriveStatsJson, RecentSamplesJson, SessionsCount)
+    VALUES (@ServerName, @LastUpdated, @CpuPercent, @MemoryUsedMB, @MemoryTotalMB, @DriveStatsJson, @RecentSamplesJson, @SessionsCount);";
 
             try
             {
                 using (var conn = new SqlConnection(_connectionString))
-                using (var cmd = new SqlCommand(sql, conn))
                 {
-                    cmd.Parameters.AddWithValue("@ServerName", _serverName);
-                    cmd.Parameters.AddWithValue("@LastUpdated", lastUpdated);
-                    cmd.Parameters.Add("@CpuPercent", SqlDbType.Decimal).Value = (object)sample.Cpu ?? DBNull.Value;
-                    cmd.Parameters.Add("@MemoryUsedMB", SqlDbType.BigInt).Value = (object)sample.MemUsed ?? DBNull.Value;
-                    cmd.Parameters.Add("@MemoryTotalMB", SqlDbType.BigInt).Value = (object)sample.MemTotal ?? DBNull.Value;
-                    cmd.Parameters.Add("@DriveStatsJson", SqlDbType.NVarChar, -1).Value = string.IsNullOrEmpty(driveStatsJson) ? (object)DBNull.Value : driveStatsJson;
-                    cmd.Parameters.Add("@RecentSamplesJson", SqlDbType.NVarChar, -1).Value = recentSamplesJson;
                     conn.Open();
-                    cmd.ExecuteNonQuery();
+                    using (var tx = conn.BeginTransaction())
+                    {
+                        using (var cmd = new SqlCommand(sql, conn, tx))
+                        {
+                            cmd.Parameters.AddWithValue("@ServerName", _serverName);
+                            cmd.Parameters.AddWithValue("@LastUpdated", lastUpdated);
+                            cmd.Parameters.Add("@CpuPercent", SqlDbType.Decimal).Value = (object)sample.Cpu ?? DBNull.Value;
+                            cmd.Parameters.Add("@MemoryUsedMB", SqlDbType.BigInt).Value = (object)sample.MemUsed ?? DBNull.Value;
+                            cmd.Parameters.Add("@MemoryTotalMB", SqlDbType.BigInt).Value = (object)sample.MemTotal ?? DBNull.Value;
+                            cmd.Parameters.Add("@DriveStatsJson", SqlDbType.NVarChar, -1).Value = string.IsNullOrEmpty(driveStatsJson) ? (object)DBNull.Value : driveStatsJson;
+                            cmd.Parameters.Add("@RecentSamplesJson", SqlDbType.NVarChar, -1).Value = recentSamplesJson;
+                            cmd.Parameters.Add("@SessionsCount", SqlDbType.Int).Value = (object)sessionsCount ?? DBNull.Value;
+                            cmd.ExecuteNonQuery();
+                        }
+
+                        if (_rosterEnabled)
+                            SyncRosterSessions(conn, tx, lastUpdated, rosterSessions ?? new List<RosterSessionSnapshot>());
+
+                        tx.Commit();
+                    }
                 }
             }
             catch (Exception ex)
@@ -331,6 +415,70 @@ WHEN NOT MATCHED THEN
                     full = full + " | " + ex.InnerException.Message;
                 LogEvent("SQL Current Update fehlgeschlagen: " + full);
             }
+        }
+
+        private void SyncRosterSessions(SqlConnection conn, SqlTransaction tx, DateTime snapshotTime, List<RosterSessionSnapshot> currentSessions)
+        {
+            var open = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            const string selectOpenSql = @"SELECT Id, UserName, EmployeeNumber FROM [dbo].[azm_tool_roster_sessions] WHERE ServerName=@ServerName AND SessionEnd IS NULL";
+            using (var cmd = new SqlCommand(selectOpenSql, conn, tx))
+            {
+                cmd.Parameters.AddWithValue("@ServerName", _serverName);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        long id = reader.GetInt64(0);
+                        string user = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                        string emp = reader.IsDBNull(2) ? "" : reader.GetString(2);
+                        string key = BuildSessionKey(user, emp);
+                        if (!open.ContainsKey(key))
+                            open[key] = id;
+                    }
+                }
+            }
+
+            var current = new Dictionary<string, RosterSessionSnapshot>(StringComparer.OrdinalIgnoreCase);
+            foreach (var s in currentSessions)
+            {
+                string key = BuildSessionKey(s.UserName, s.EmployeeNumber);
+                if (!current.ContainsKey(key))
+                    current[key] = s;
+            }
+
+            const string insertSql = @"INSERT INTO [dbo].[azm_tool_roster_sessions] (ServerName, SnapshotTime, UserName, EmployeeNumber, SessionStart, SessionEnd) VALUES (@ServerName, @SnapshotTime, @UserName, @EmployeeNumber, @SessionStart, NULL)";
+            foreach (var kv in current)
+            {
+                if (open.ContainsKey(kv.Key)) continue;
+                using (var cmd = new SqlCommand(insertSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("@ServerName", _serverName);
+                    cmd.Parameters.AddWithValue("@SnapshotTime", snapshotTime);
+                    cmd.Parameters.AddWithValue("@UserName", kv.Value.UserName ?? "");
+                    cmd.Parameters.AddWithValue("@EmployeeNumber", string.IsNullOrEmpty(kv.Value.EmployeeNumber) ? (object)DBNull.Value : kv.Value.EmployeeNumber);
+                    cmd.Parameters.AddWithValue("@SessionStart", snapshotTime);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            const string updateEndSql = @"UPDATE [dbo].[azm_tool_roster_sessions] SET SessionEnd=@SessionEnd WHERE Id=@Id AND SessionEnd IS NULL";
+            foreach (var kv in open)
+            {
+                if (current.ContainsKey(kv.Key)) continue;
+                using (var cmd = new SqlCommand(updateEndSql, conn, tx))
+                {
+                    cmd.Parameters.AddWithValue("@SessionEnd", snapshotTime);
+                    cmd.Parameters.AddWithValue("@Id", kv.Value);
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static string BuildSessionKey(string userName, string employeeNumber)
+        {
+            string user = userName == null ? "" : userName.Trim();
+            string emp = employeeNumber == null ? "" : employeeNumber.Trim();
+            return (user + "|" + emp).ToUpperInvariant();
         }
 
         private void FlushHourToHistory()
@@ -464,6 +612,26 @@ VALUES (@ServerName, @HourStart, @CpuAvg, @MemoryUsedAvgMB, @MemoryTotalMB, @Dri
             catch { }
         }
 
+        private class RosterStatusResponse
+        {
+            [JsonProperty("activeSessions")]
+            public List<RosterSessionApiItem> ActiveSessions { get; set; }
+        }
+
+        private class RosterSessionApiItem
+        {
+            [JsonProperty("userName")]
+            public string UserName { get; set; }
+            [JsonProperty("employeeNumber")]
+            public string EmployeeNumber { get; set; }
+        }
+
+        private class RosterSessionSnapshot
+        {
+            public string UserName { get; set; }
+            public string EmployeeNumber { get; set; }
+        }
+
         private class SampleRecord
         {
             [JsonProperty("t")]
@@ -507,6 +675,8 @@ VALUES (@ServerName, @HourStart, @CpuAvg, @MemoryUsedAvgMB, @MemoryTotalMB, @Dri
             public decimal? Cpu { get; set; }
             [JsonProperty("ram")]
             public decimal? Ram { get; set; }
+            [JsonProperty("sessions")]
+            public int? Sessions { get; set; }
             [JsonProperty("drives")]
             public List<GraphDrive> Drives { get; set; }
         }
