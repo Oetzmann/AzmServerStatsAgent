@@ -37,7 +37,8 @@ namespace AzmServerStatsAgent
             if (string.IsNullOrWhiteSpace(_serverName))
                 _serverName = Environment.MachineName;
 
-            _connectionString = ConfigurationManager.ConnectionStrings["StatsDb"]?.ConnectionString;
+            var connStringSetting = ConfigurationManager.ConnectionStrings["StatsDb"];
+            _connectionString = connStringSetting != null ? connStringSetting.ConnectionString : null;
             if (string.IsNullOrWhiteSpace(_connectionString))
             {
                 LogEvent("ConnectionString 'StatsDb' fehlt in App.config.");
@@ -156,6 +157,7 @@ namespace AzmServerStatsAgent
                         if (v != null && v != DBNull.Value)
                         {
                             uint u = (uint)v;
+                            if (u > 100) u = 100;
                             return (decimal)u;
                         }
                     }
@@ -250,24 +252,61 @@ namespace AzmServerStatsAgent
             }
         }
 
+        /// <summary>Ring-Puffer für die letzten 30 Min Samples (max 60 bei 30s-Intervall).</summary>
+        private readonly List<GraphSample> _recentSamples = new List<GraphSample>();
+        private static readonly int RecentMinutes = 30;
+
         private void UpdateCurrentInSql(SampleRecord sample)
         {
             string driveStatsJson = sample.Drives != null && sample.Drives.Count > 0
                 ? JsonConvert.SerializeObject(sample.Drives)
                 : null;
 
+            DateTime lastUpdated;
+            if (!DateTime.TryParse(sample.T, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out lastUpdated))
+                lastUpdated = DateTime.Now;
+
+            /* --- Graph-Sample bauen und Ringpuffer pflegen --- */
+            var gs = new GraphSample { T = lastUpdated.ToString("yyyy-MM-dd\\THH:mm:ss", CultureInfo.InvariantCulture) };
+            gs.Cpu = sample.Cpu.HasValue ? Math.Round(sample.Cpu.Value, 1) : (decimal?)null;
+            if (sample.MemUsed.HasValue && sample.MemTotal.HasValue && sample.MemTotal.Value > 0)
+                gs.Ram = Math.Round((decimal)sample.MemUsed.Value * 100 / sample.MemTotal.Value, 1);
+            if (sample.Drives != null && sample.Drives.Count > 0)
+            {
+                gs.Drives = new List<GraphDrive>();
+                foreach (var d in sample.Drives)
+                {
+                    decimal pct = 0;
+                    if (d.TotalGB > 0)
+                        pct = Math.Round((decimal)((d.TotalGB - d.FreeGB) * 100.0 / d.TotalGB), 1);
+                    if (pct < 0) pct = 0;
+                    if (pct > 100) pct = 100;
+                    gs.Drives.Add(new GraphDrive { D = d.Drive, Pct = pct });
+                }
+            }
+            _recentSamples.Add(gs);
+
+            /* Einträge älter als 30 Min entfernen */
+            DateTime cutoff = lastUpdated.AddMinutes(-RecentMinutes);
+            _recentSamples.RemoveAll(delegate(GraphSample s)
+            {
+                DateTime dt;
+                if (DateTime.TryParse(s.T, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))
+                    return dt < cutoff;
+                return false;
+            });
+
+            string recentSamplesJson = JsonConvert.SerializeObject(_recentSamples);
+
+            /* --- SQL MERGE mit RecentSamplesJson --- */
             string sql = @"
 MERGE [dbo].[azm_tool_server_stats_current] AS t
 USING (SELECT @ServerName AS ServerName) AS s ON t.ServerName = s.ServerName
 WHEN MATCHED THEN
-    UPDATE SET LastUpdated=@LastUpdated, CpuPercent=@CpuPercent, MemoryUsedMB=@MemoryUsedMB, MemoryTotalMB=@MemoryTotalMB, DriveStatsJson=@DriveStatsJson
+    UPDATE SET LastUpdated=@LastUpdated, CpuPercent=@CpuPercent, MemoryUsedMB=@MemoryUsedMB, MemoryTotalMB=@MemoryTotalMB, DriveStatsJson=@DriveStatsJson, RecentSamplesJson=@RecentSamplesJson
 WHEN NOT MATCHED THEN
-    INSERT (ServerName, LastUpdated, CpuPercent, MemoryUsedMB, MemoryTotalMB, DriveStatsJson)
-    VALUES (@ServerName, @LastUpdated, @CpuPercent, @MemoryUsedMB, @MemoryTotalMB, @DriveStatsJson);";
-
-            DateTime lastUpdated;
-            if (!DateTime.TryParse(sample.T, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out lastUpdated))
-                lastUpdated = DateTime.Now;
+    INSERT (ServerName, LastUpdated, CpuPercent, MemoryUsedMB, MemoryTotalMB, DriveStatsJson, RecentSamplesJson)
+    VALUES (@ServerName, @LastUpdated, @CpuPercent, @MemoryUsedMB, @MemoryTotalMB, @DriveStatsJson, @RecentSamplesJson);";
 
             try
             {
@@ -280,6 +319,7 @@ WHEN NOT MATCHED THEN
                     cmd.Parameters.Add("@MemoryUsedMB", SqlDbType.BigInt).Value = (object)sample.MemUsed ?? DBNull.Value;
                     cmd.Parameters.Add("@MemoryTotalMB", SqlDbType.BigInt).Value = (object)sample.MemTotal ?? DBNull.Value;
                     cmd.Parameters.Add("@DriveStatsJson", SqlDbType.NVarChar, -1).Value = string.IsNullOrEmpty(driveStatsJson) ? (object)DBNull.Value : driveStatsJson;
+                    cmd.Parameters.Add("@RecentSamplesJson", SqlDbType.NVarChar, -1).Value = recentSamplesJson;
                     conn.Open();
                     cmd.ExecuteNonQuery();
                 }
@@ -456,6 +496,27 @@ VALUES (@ServerName, @HourStart, @CpuAvg, @MemoryUsedAvgMB, @MemoryTotalMB, @Dri
             public double MinFreeGB { get; set; }
             [JsonProperty("AvgFreeGB")]
             public double AvgFreeGB { get; set; }
+        }
+
+        /// <summary>Graph-Sample für RecentSamplesJson (Frontend Chart.js).</summary>
+        private class GraphSample
+        {
+            [JsonProperty("t")]
+            public string T { get; set; }
+            [JsonProperty("cpu")]
+            public decimal? Cpu { get; set; }
+            [JsonProperty("ram")]
+            public decimal? Ram { get; set; }
+            [JsonProperty("drives")]
+            public List<GraphDrive> Drives { get; set; }
+        }
+
+        private class GraphDrive
+        {
+            [JsonProperty("d")]
+            public string D { get; set; }
+            [JsonProperty("pct")]
+            public decimal Pct { get; set; }
         }
     }
 }
